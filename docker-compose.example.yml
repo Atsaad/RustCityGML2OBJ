@@ -1,0 +1,47 @@
+# Example Docker Compose integration for RustCityGML2OBJ
+# This file shows how to integrate the converter into a larger Docker Compose pipeline
+
+version: '3.8'
+
+services:
+  citygml2obj:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rustcitygml2obj:latest
+    container_name: citygml2obj
+    volumes:
+      # Mount your input directory (change to your actual path)
+      - ./input:/input:ro
+      # Mount your output directory (change to your actual path)
+      - ./output:/output
+    # Uncomment and customize the command for your use case:
+    # command: ["--input", "/input", "--output", "/output"]
+    # 
+    # With all features:
+    # command: ["--input", "/input", "--output", "/output", "--tbw", "--add-bb", "--add-json", "--group-sc", "--group-scomp"]
+
+# Example: Integration with other services in a pipeline
+# services:
+#   preprocessing:
+#     image: your-preprocessing-service
+#     volumes:
+#       - ./raw-data:/input
+#       - ./input:/output
+#
+#   citygml2obj:
+#     depends_on:
+#       - preprocessing
+#     build: .
+#     volumes:
+#       - ./input:/input:ro
+#       - ./output:/output
+#     command: ["--input", "/input", "--output", "/output", "--tbw", "--add-bb"]
+#
+#   postprocessing:
+#     depends_on:
+#       - citygml2obj
+#     image: your-postprocessing-service
+#     volumes:
+#       - ./output:/input
+#       - ./final-output:/output
