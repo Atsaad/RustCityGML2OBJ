@@ -1,5 +1,6 @@
-use ecitygml_core::model::building::Building;
+use ecitygml_core::model::building::{Building, BuildingConstructiveElement};
 use ecitygml_core::model::construction::{GroundSurface, RoofSurface, WallSurface};
+use ecitygml_core::operations::FeatureWithGeometry;
 use egml::model::geometry::{MultiSurface, Polygon};
 use egml::operations::geometry::Geometry;
 
@@ -8,7 +9,7 @@ pub fn process_building_components_sequential(input_building: &Building) -> Vec<
     let mut all_wall_points: Vec<[f64; 3]> = Vec::new();
     let mut all_roof_points: Vec<[f64; 3]> = Vec::new();
     let mut all_ground_points: Vec<[f64; 3]> = Vec::new();
-    
+
     // Obtain the building id
     let all_wall_surface = &input_building.wall_surface;
     for wall_surface in all_wall_surface {
@@ -31,10 +32,45 @@ pub fn process_building_components_sequential(input_building: &Building) -> Vec<
         all_ground_points.extend(&all_ground_points_tmp);
     }
 
+    // Take care of BuildingConstructiveElements (IFC-converted CityGML 3.0)
+    for bce in &input_building.building_constructive_element {
+        let bce_points = process_building_constructive_element_sequential(bce);
+        all_building_points.extend(bce_points);
+    }
+
     all_building_points.extend(&all_ground_points);
     all_building_points.extend(&all_roof_points);
     all_building_points.extend(&all_wall_points);
     return all_building_points;
+}
+
+pub fn process_building_constructive_element_sequential(
+    input_bce: &BuildingConstructiveElement,
+) -> Vec<[f64; 3]> {
+    let mut all_points: Vec<[f64; 3]> = Vec::new();
+    let space = &input_bce.occupied_space.space;
+
+    // Extract from lod3MultiSurface
+    if let Some(multi_surface) = &space.lod3_multi_surface {
+        all_points.extend(process_multi_surface_sequential(multi_surface));
+    }
+    // Extract from lod2MultiSurface
+    if let Some(multi_surface) = &space.lod2_multi_surface {
+        all_points.extend(process_multi_surface_sequential(multi_surface));
+    }
+    // Extract from lod3Solid
+    if let Some(solid) = &space.lod3_solid {
+        for point in solid.points() {
+            all_points.push([point.x(), point.y(), point.z()]);
+        }
+    }
+    // Extract from lod2Solid
+    if let Some(solid) = &space.lod2_solid {
+        for point in solid.points() {
+            all_points.push([point.x(), point.y(), point.z()]);
+        }
+    }
+    all_points
 }
 
 pub fn process_wall_surface_sequential(input_wall_surface: &WallSurface) -> Vec<[f64; 3]> {

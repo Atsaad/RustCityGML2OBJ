@@ -6,6 +6,7 @@ mod write_functions;
 use clap::Parser;
 use rayon::prelude::*;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 #[derive(Parser, Debug)]
@@ -44,6 +45,51 @@ struct Args {
     group_scomp: bool,
 }
 
+/// Preprocess a GML file to strip namespace prefixes that the egml parser
+/// doesn't handle (e.g. `<core:lod3Solid>` → `<lod3Solid>`).
+/// Returns the original path if no changes needed, or a temp file path.
+fn preprocess_gml(path: &Path) -> std::path::PathBuf {
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return path.to_path_buf(),
+    };
+
+    // Only preprocess if we detect prefixed lod/boundary tags
+    if !content.contains("<core:lod") && !content.contains("<core:boundary") {
+        return path.to_path_buf();
+    }
+
+    println!("  Preprocessing: stripping namespace prefixes for parser compatibility");
+
+    let mut result = content;
+    // Strip core: prefix from lod and boundary tags (opening and closing)
+    for tag in &[
+        "lod0MultiSurface", "lod1Solid", "lod2Solid", "lod3Solid",
+        "lod0MultiSurface", "lod2MultiSurface", "lod3MultiSurface",
+        "lod1ImplicitRepresentation", "lod2ImplicitRepresentation",
+        "lod3ImplicitRepresentation", "boundary",
+    ] {
+        result = result.replace(
+            &format!("<core:{}", tag),
+            &format!("<{}", tag),
+        );
+        result = result.replace(
+            &format!("</core:{}", tag),
+            &format!("</{}", tag),
+        );
+    }
+
+    // Write to a temp file next to the original
+    let temp_path = path.with_extension("preprocessed.gml");
+    if let Ok(mut f) = fs::File::create(&temp_path) {
+        if f.write_all(result.as_bytes()).is_ok() {
+            return temp_path;
+        }
+    }
+
+    path.to_path_buf()
+}
+
 fn main() {
     let args = Args::parse();
     println!("Input Directory: {}", args.input);
@@ -68,7 +114,10 @@ fn main() {
             if ext == "gml" || ext == "xml" {
                 println!("Processing file: {}", path.display());
 
-                let reader_result = ecitygml_io::CitygmlReader::from_path(&path);
+                // Preprocess: strip namespace prefixes from CityGML 3.0 core/bldg/con
+                // elements so the egml parser can match them (it expects unprefixed tags)
+                let effective_path = preprocess_gml(&path);
+                let reader_result = ecitygml_io::CitygmlReader::from_path(&effective_path);
 
                 match reader_result.unwrap().finish() {
                     Ok(mut data) => {
@@ -89,6 +138,11 @@ fn main() {
                     Err(e) => {
                         eprintln!("Error reading file {}: {:?}", path.display(), e);
                     }
+                }
+
+                // Clean up preprocessed temp file
+                if effective_path != path {
+                    let _ = fs::remove_file(&effective_path);
                 }
             }
         }

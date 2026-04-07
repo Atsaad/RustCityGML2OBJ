@@ -5,9 +5,10 @@ use ecitygml::operations::GeometryCollector;
 use ecitygml_core::model::building::Building;
 use ecitygml_core::model::common::{CityObjectClass, LevelOfDetail};
 use ecitygml_core::operations::{FeatureWithGeometry, Visitable};
-use egml::model::base::Id;
+use egml::model::base::{Gml, Id};
 use egml::model::geometry::{MultiSurface, Polygon};
 use egml::operations::triangulate::Triangulate;
+use egml::operations::geometry::Geometry;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -85,6 +86,7 @@ pub fn collect_building_geometries(
             let multi_surfaces = &collected_geometry.1.multi_surfaces;
 
             let class_key = city_object_class_to_str(class).to_owned();
+            let solids = &collected_geometry.1.solids;
 
             for multi_surface in multi_surfaces {
                 process_multi_surface(
@@ -100,6 +102,35 @@ pub fn collect_building_geometries(
                     groups_by_semantic_surface.clone(),
                     class_key.clone(),
                 );
+            }
+
+            // Process solids (e.g. from BuildingConstructiveElement with lod3Solid)
+            for solid in solids {
+                let solid_obj = solid.1;
+                for surface_property in solid_obj.members() {
+                    if let Some(ring) = &surface_property.linear_ring {
+                        if let Ok(polygon) = Polygon::new(
+                            Gml::new(Id::from_hashed_string(&surface_property.href)),
+                            ring.clone(),
+                            Vec::new(),
+                        ) {
+                            process_surface_member(
+                                &polygon,
+                                building_id,
+                                &solid_obj.gml.id,
+                                class,
+                                dx,
+                                dy,
+                                dz,
+                                &bbox,
+                                gml_id,
+                                class_key.clone(),
+                                groups_by_class.clone(),
+                                groups_by_semantic_surface.clone(),
+                            );
+                        }
+                    }
+                }
             }
         });
 
