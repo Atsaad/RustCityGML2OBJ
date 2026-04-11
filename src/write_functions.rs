@@ -1,3 +1,4 @@
+use crate::conversion_functions::CityObjectAttributes;
 use crate::Args;
 use clap::Parser;
 use egml::model::base::Id;
@@ -30,6 +31,12 @@ struct Metadata {
     multi_surface_gml_id: String,
     polygon_gml_id: String,
     thematic_role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    function: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     dx: String,
     dy: String,
     dz: String,
@@ -45,6 +52,7 @@ pub fn write_json_metadata(
     dz: f64,
     gml_id: &Id,
     stuff_gml_id: &Id,
+    attrs: &CityObjectAttributes,
 ) {
     let mut semantic_surface_string: String = "default".to_string();
 
@@ -65,6 +73,9 @@ pub fn write_json_metadata(
         multi_surface_gml_id: stuff_gml_id.to_string(),
         polygon_gml_id: semantic_surface_string,
         thematic_role: thematic_role.to_string(),
+        class: attrs.class.clone(),
+        function: attrs.function.clone(),
+        name: attrs.name.clone(),
         dx: dx.to_string(),
         dy: dy.to_string(),
         dz: dz.to_string(),
@@ -104,6 +115,7 @@ pub fn write_obj_file(
     bbox: &(Vec<[f64; 3]>, Vec<[u64; 3]>),
     gml_id: &Id,
     stuff_gml_id: &Id,
+    attrs: &CityObjectAttributes,
 ) {
     let args = Args::parse();
     let building_id_string = building_id.to_string();
@@ -195,6 +207,7 @@ pub fn write_obj_file(
             dz,
             gml_id,
             stuff_gml_id,
+            attrs,
         );
     }
 }

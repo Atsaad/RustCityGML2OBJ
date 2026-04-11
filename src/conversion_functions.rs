@@ -1,20 +1,69 @@
-use crate::geometry_functions::{construct_buffered_bounding_box, triangulate};
+use crate::geometry_functions::{construct_buffered_bounding_box, triangulate_surface_kind};
 use crate::write_functions;
 use crate::write_functions::write_obj_file;
-use ecitygml::operations::GeometryCollector;
 use ecitygml_core::model::building::Building;
-use ecitygml_core::model::common::{CityObjectClass, LevelOfDetail};
-use ecitygml_core::operations::{FeatureWithGeometry, Visitable};
-use egml::model::base::{Gml, Id};
-use egml::model::geometry::{MultiSurface, Polygon};
-use egml::operations::triangulate::Triangulate;
-use egml::operations::geometry::Geometry;
+use ecitygml_core::model::common::CityObjectClass;
+use ecitygml_core::model::core::{AsAbstractFeature, CityObjectRef};
+use ecitygml_core::operations::CityObjectGeometry;
+use egml::model::base::Id;
+use egml::model::geometry::primitives::SurfaceKind;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-// Helper container that stores all vertices and triangles that belong to one
-// semantic surface class (e.g. WallSurface, RoofSurface, …).
+/// Attributes extracted from CityGML city objects that complement the CityObjectClass.
+/// These follow the CityGML 3.0 schema naming: `class`, `function`, and `name`.
+#[derive(Debug, Clone, Default)]
+pub struct CityObjectAttributes {
+    /// The `class` attribute (e.g., "IfcWallStandardCase", "IfcSlab").
+    /// Corresponds to `bldg:class` / `con:class` in CityGML.
+    pub class: Option<String>,
+    /// The `function` attribute(s), joined by "; " if multiple.
+    /// Corresponds to `bldg:function` / `con:function` in CityGML.
+    pub function: Option<String>,
+    /// The `gml:name` value(s), joined by "; " if multiple.
+    pub name: Option<String>,
+}
+
+/// Extract classification attributes from a CityObjectRef.
+/// Works generically for all city object types that carry `class`, `function`,
+/// or `gml:name` — including native CityGML 3.0 LOD3 and IFC-derived files.
+pub fn extract_city_object_attributes(co_ref: &CityObjectRef) -> CityObjectAttributes {
+    let names: &Vec<String> = co_ref.name();
+    let name = if names.is_empty() {
+        None
+    } else {
+        Some(names.join("; "))
+    };
+
+    let (class, function) = match co_ref {
+        CityObjectRef::BuildingConstructiveElement(x) => (
+            x.class().as_ref().map(|c| c.value.clone()),
+            {
+                let fns: Vec<String> = x.functions().iter().map(|c| c.value.clone()).collect();
+                if fns.is_empty() { None } else { Some(fns.join("; ")) }
+            },
+        ),
+        CityObjectRef::BuildingInstallation(x) => (
+            x.class().as_ref().map(|c| c.value.clone()),
+            {
+                let fns: Vec<String> = x.functions().iter().map(|c| c.value.clone()).collect();
+                if fns.is_empty() { None } else { Some(fns.join("; ")) }
+            },
+        ),
+        CityObjectRef::BuildingRoom(x) => (
+            x.class().as_ref().map(|c| c.value.clone()),
+            {
+                let fns: Vec<String> = x.functions().iter().map(|c| c.value.clone()).collect();
+                if fns.is_empty() { None } else { Some(fns.join("; ")) }
+            },
+        ),
+        _ => (None, None),
+    };
+
+    CityObjectAttributes { class, function, name }
+}
+
 #[derive(Debug, Default)]
 struct SurfaceGroup {
     vertices: Vec<[f64; 3]>,
@@ -23,47 +72,55 @@ struct SurfaceGroup {
 }
 
 pub fn collect_building_geometries(
-    input_building: &mut Building,
+    input_building: &Building,
     tbw: bool,
     add_bb: bool,
-    add_json: bool,
-    import_bb: bool,
+    _add_json: bool,
+    _import_bb: bool,
     group_by_surface: bool,
     group_by_semantic_surface: bool,
 ) {
-    // Initialize an empty bounding box
     let mut bbox = (Vec::new(), Vec::new());
 
-    // Distinguish the different cases of the bounding box
     if add_bb {
         bbox = construct_buffered_bounding_box(input_building);
-    } else if import_bb {
-        // Import the bounding box from an external file
-        // todo: Muss noch implementiert werden.
     }
 
-    let building_id = &input_building.occupied_space.space.city_object.gml.id;
+    let building_id = input_building.id();
 
-    // get the translation parameter into a local crs in case it is desired
     let mut dx: f64 = 0.0;
     let mut dy: f64 = 0.0;
     let mut dz: f64 = 0.0;
     if tbw {
-        if let Some(envelope) = input_building.envelope() {
+        if let Some(envelope) = input_building.bounded_by() {
             let upper_corner = envelope.upper_corner();
             let lower_corner = envelope.lower_corner();
             dx = -((upper_corner.x() + lower_corner.x()) / 2.0);
             dy = -((upper_corner.y() + lower_corner.y()) / 2.0);
             dz = -((upper_corner.z() + lower_corner.z()) / 2.0);
         } else {
-            println!("Envelope hat keine gültigen lower/upper corner Koordinaten.");
+            let centroid = crate::translation_module::compute_building_centroid(input_building);
+            if let Some((cx, cy, cz)) = centroid {
+                dx = -cx;
+                dy = -cy;
+                dz = -cz;
+            } else {
+                println!("Envelope hat keine gültigen lower/upper corner Koordinaten.");
+            }
         }
     }
 
-    let mut collector_1 = GeometryCollector::new();
-    input_building.accept(&mut collector_1);
+    // Collect geometry and classification attributes from all city objects
+    let geometry_map: Vec<(Id, CityObjectGeometry, CityObjectAttributes)> = input_building
+        .iter_city_object()
+        .map(|co_ref| {
+            let id = co_ref.id().clone();
+            let attrs = extract_city_object_attributes(&co_ref);
+            let geom = CityObjectGeometry::from_city_object(co_ref);
+            (id, geom, attrs)
+        })
+        .collect();
 
-    // Prepare optional shared accumulators
     let groups_by_class: Option<Arc<Mutex<HashMap<String, SurfaceGroup>>>> = if group_by_surface {
         Some(Arc::new(Mutex::new(HashMap::new())))
     } else {
@@ -77,64 +134,50 @@ pub fn collect_building_geometries(
             None
         };
 
-    collector_1
-        .city_objects
+    geometry_map
         .par_iter()
-        .for_each(|collected_geometry| {
-            let gml_id = &collected_geometry.1.gml.id;
-            let class = collected_geometry.1.class;
-            let multi_surfaces = &collected_geometry.1.multi_surfaces;
-
+        .for_each(|(gml_id, geom, attrs)| {
+            let class = geom.class;
             let class_key = city_object_class_to_str(class).to_owned();
-            let solids = &collected_geometry.1.solids;
 
-            for multi_surface in multi_surfaces {
-                process_multi_surface(
-                    &multi_surface,
-                    building_id,
-                    class,
-                    dx,
-                    dy,
-                    dz,
-                    &bbox,
-                    gml_id,
-                    groups_by_class.clone(),
-                    groups_by_semantic_surface.clone(),
-                    class_key.clone(),
-                );
+            // Process multi_surfaces
+            for (_lod, multi_surface) in &geom.multi_surfaces {
+                for surface_kind in multi_surface.surface_member() {
+                    process_surface_kind(
+                        surface_kind,
+                        building_id,
+                        class,
+                        dx, dy, dz,
+                        &bbox,
+                        gml_id,
+                        class_key.clone(),
+                        groups_by_class.clone(),
+                        groups_by_semantic_surface.clone(),
+                        attrs,
+                    );
+                }
             }
 
-            // Process solids (e.g. from BuildingConstructiveElement with lod3Solid)
-            for solid in solids {
-                let solid_obj = solid.1;
-                for surface_property in solid_obj.members() {
-                    if let Some(ring) = &surface_property.linear_ring {
-                        if let Ok(polygon) = Polygon::new(
-                            Gml::new(Id::from_hashed_string(&surface_property.href)),
-                            ring.clone(),
-                            Vec::new(),
-                        ) {
-                            process_surface_member(
-                                &polygon,
-                                building_id,
-                                &solid_obj.gml.id,
-                                class,
-                                dx,
-                                dy,
-                                dz,
-                                &bbox,
-                                gml_id,
-                                class_key.clone(),
-                                groups_by_class.clone(),
-                                groups_by_semantic_surface.clone(),
-                            );
-                        }
-                    }
+            // Process solids
+            for (_lod, solid) in &geom.solids {
+                for surface_property in solid.members() {
+                    process_surface_kind(
+                        &surface_property.content,
+                        building_id,
+                        class,
+                        dx, dy, dz,
+                        &bbox,
+                        gml_id,
+                        class_key.clone(),
+                        groups_by_class.clone(),
+                        groups_by_semantic_surface.clone(),
+                        attrs,
+                    );
                 }
             }
         });
 
-    //  Write grouped OBJ files (semantic class level)
+    // Write grouped OBJ files (semantic class level)
     if let Some(groups_arc) = groups_by_class {
         let map = Arc::try_unwrap(groups_arc)
             .expect("Unexpected Arc reference count")
@@ -143,19 +186,18 @@ pub fn collect_building_geometries(
 
         for (class_key, group) in map {
             let filename = format!("{}_{}.obj", building_id, class_key);
-
+            let empty_attrs = CityObjectAttributes::default();
             write_obj_file(
                 group.vertices,
                 group.triangles,
                 building_id,
                 write_functions::SemanticSurfaceId::Str(&filename),
                 &class_key,
-                dx,
-                dy,
-                dz,
+                dx, dy, dz,
                 &bbox,
                 &Id::from_hashed_string("grouped"),
                 &Id::from_hashed_string("grouped"),
+                &empty_attrs,
             );
         }
     }
@@ -170,65 +212,26 @@ pub fn collect_building_geometries(
         for (surface_id, group) in map {
             let class_name = group.class_name.as_deref().unwrap_or("UnknownSurface");
             let filename = format!("{}_{}_{}", building_id, class_name, surface_id);
-            println!("filename {}", class_name);
+            let empty_attrs = CityObjectAttributes::default();
             write_obj_file(
                 group.vertices,
                 group.triangles,
                 building_id,
                 write_functions::SemanticSurfaceId::Str(&filename),
-                &class_name,
-                dx,
-                dy,
-                dz,
+                class_name,
+                dx, dy, dz,
                 &bbox,
                 &Id::from_hashed_string("grouped"),
                 &Id::from_hashed_string(&filename),
+                &empty_attrs,
             );
         }
     }
-
-    if add_json {
-        // TODO: muss noch implementiert werden
-    }
 }
 
-pub fn process_multi_surface(
-    input_multi_surface: &(&LevelOfDetail, &MultiSurface),
+pub fn process_surface_kind(
+    surface_kind: &SurfaceKind,
     building_id: &Id,
-    class: CityObjectClass,
-    dx: f64,
-    dy: f64,
-    dz: f64,
-    bbox: &(Vec<[f64; 3]>, Vec<[u64; 3]>),
-    gml_id: &Id,
-    groups_by_class: Option<Arc<Mutex<HashMap<String, SurfaceGroup>>>>,
-    groups_by_semantic_surface: Option<Arc<Mutex<HashMap<String, SurfaceGroup>>>>,
-    class_key: String,
-) {
-    let stuffs = &input_multi_surface.1.surface_member();
-    let stuff_gml_id = &input_multi_surface.1.gml.id;
-    stuffs.par_iter().for_each(|surface_member| {
-        process_surface_member(
-            surface_member,
-            building_id,
-            stuff_gml_id,
-            class,
-            dx,
-            dy,
-            dz,
-            bbox,
-            gml_id,
-            class_key.clone(),
-            groups_by_class.clone(),
-            groups_by_semantic_surface.clone(),
-        );
-    });
-}
-
-pub fn process_surface_member(
-    input_surface_member: &Polygon,
-    building_id: &Id,
-    multi_surface_id: &Id,
     thematic_info: CityObjectClass,
     dx: f64,
     dy: f64,
@@ -238,15 +241,17 @@ pub fn process_surface_member(
     class_key: String,
     groups_by_class: Option<Arc<Mutex<HashMap<String, SurfaceGroup>>>>,
     groups_by_semantic_surface: Option<Arc<Mutex<HashMap<String, SurfaceGroup>>>>,
+    attrs: &CityObjectAttributes,
 ) {
-    let (triangles, all_points) = triangulate(input_surface_member);
-    let surface_id = input_surface_member.gml.id.clone();
+    let (triangles, all_points, surface_id) = triangulate_surface_kind(surface_kind);
+
+    if triangles.is_empty() {
+        return;
+    }
 
     // Semantic surface grouping
     if let Some(groups_arc) = groups_by_semantic_surface {
         let mut map = groups_arc.lock().unwrap();
-
-        // Create or fetch the group for this semantic surface
         let bucket = map.entry(surface_id.to_string()).or_insert_with(|| {
             let mut g = SurfaceGroup::default();
             g.class_name = Some(class_key.clone());
@@ -255,28 +260,20 @@ pub fn process_surface_member(
 
         let vertex_offset = bucket.vertices.len() as u32;
         bucket.vertices.extend_from_slice(&all_points);
-
-        let shifted: Vec<u32> = triangles
-            .into_iter()
-            .map(|idx| idx + vertex_offset)
-            .collect();
+        let shifted: Vec<u32> = triangles.into_iter().map(|idx| idx + vertex_offset).collect();
         bucket.triangles.extend(shifted);
     }
-    // Existing: semantic class grouping
+    // Semantic class grouping
     else if let Some(groups_arc) = groups_by_class {
         let mut map = groups_arc.lock().unwrap();
         let bucket = map.entry(class_key).or_default();
 
         let vertex_offset = bucket.vertices.len() as u32;
         bucket.vertices.extend_from_slice(&all_points);
-
-        let shifted: Vec<u32> = triangles
-            .into_iter()
-            .map(|idx| idx + vertex_offset)
-            .collect();
+        let shifted: Vec<u32> = triangles.into_iter().map(|idx| idx + vertex_offset).collect();
         bucket.triangles.extend(shifted);
     }
-    // per-polygon output
+    // Per-polygon output
     else {
         let thematic_info_string = city_object_class_to_str(thematic_info);
         write_obj_file(
@@ -284,13 +281,12 @@ pub fn process_surface_member(
             triangles,
             building_id,
             write_functions::SemanticSurfaceId::Id(&surface_id),
-            &thematic_info_string,
-            dx,
-            dy,
-            dz,
+            thematic_info_string,
+            dx, dy, dz,
             bbox,
             gml_id,
-            multi_surface_id,
+            &surface_id,
+            attrs,
         );
     }
 }
@@ -340,7 +336,7 @@ pub fn city_object_class_to_str(class: CityObjectClass) -> &'static str {
         CityObjectClass::Section => "Section",
         CityObjectClass::SolitaryVegetationObject => "SolitaryVegetationObject",
         CityObjectClass::Square => "Square",
-        CityObjectClass::Story => "Story",
+        CityObjectClass::Storey => "Storey",
         CityObjectClass::Track => "Track",
         CityObjectClass::TrafficArea => "TrafficArea",
         CityObjectClass::TrafficSpace => "TrafficSpace",
@@ -356,5 +352,6 @@ pub fn city_object_class_to_str(class: CityObjectClass) -> &'static str {
         CityObjectClass::Waterway => "Waterway",
         CityObjectClass::Window => "Window",
         CityObjectClass::WindowSurface => "WindowSurface",
+        _ => "Unknown",
     }
 }
